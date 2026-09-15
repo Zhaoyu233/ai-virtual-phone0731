@@ -43,8 +43,7 @@ export async function synthesizeSpeech(
         return synthesizeOpenAI(text, voiceConfig);
     }
 
-    if (provider === "ElevenLabs" || voiceConfig.defaultVoice?.length === 21) {
-        // 如果 voiceId 是 21 位的字符串，大概率是 ElevenLabs 的 Voice ID
+    if (provider === "ElevenLabs") {
         return synthesizeElevenLabs(text, voiceConfig);
     }
 
