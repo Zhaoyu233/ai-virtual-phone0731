@@ -159,7 +159,7 @@ async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promi
     const baseUrl = config.baseUrl || "https://api.elevenlabs.io/v1";
     
     // ElevenLabs 接口格式：POST /v1/text-to-speech/{voice_id}
-    const response = await fetchWithTimeout(`${baseUrl.replace(/\\/$/, "")}/text-to-speech/${voiceId}`, {
+    const response = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}/text-to-speech/${voiceId}`, {
         method: "POST",
         headers: {
             "xi-api-key": config.apiKey,
