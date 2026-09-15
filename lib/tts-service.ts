@@ -43,6 +43,11 @@ export async function synthesizeSpeech(
         return synthesizeOpenAI(text, voiceConfig);
     }
 
+    if (provider === "ElevenLabs" || voiceConfig.defaultVoice?.length === 21) {
+        // 如果 voiceId 是 21 位的字符串，大概率是 ElevenLabs 的 Voice ID
+        return synthesizeElevenLabs(text, voiceConfig);
+    }
+
     return null;
 }
 
@@ -143,6 +148,40 @@ async function synthesizeMinimax(text: string, config: VoiceApiConfig, emotion?:
     }
 
     throw new Error(data.base_resp?.status_msg || "Minimax 未返回音频数据");
+}
+
+// ── ElevenLabs TTS ───────────────────────────────────
+
+async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+    if (!config.apiKey) throw new Error("ElevenLabs API Key 未配置 (请在语音设置中填入 API Key)");
+
+    const voiceId = config.defaultVoice || "21m00Tcm4TlvDq8ikWAM"; // fallback 默认声音
+    const baseUrl = config.baseUrl || "https://api.elevenlabs.io/v1";
+    
+    // ElevenLabs 接口格式：POST /v1/text-to-speech/{voice_id}
+    const response = await fetchWithTimeout(`${baseUrl.replace(/\\/$/, "")}/text-to-speech/${voiceId}`, {
+        method: "POST",
+        headers: {
+            "xi-api-key": config.apiKey,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            text,
+            model_id: config.model || "eleven_multilingual_v2",
+            voice_settings: {
+                stability: 0.5,
+                similarity_boost: 0.75
+            }
+        }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`ElevenLabs TTS 请求失败 (${response.status}): ${errText}`);
+    }
+
+    const blob = await response.blob();
+    return new Blob([await blob.arrayBuffer()], { type: "audio/mpeg" });
 }
 
 // ── OpenAI TTS ──────────────────────────────────────
