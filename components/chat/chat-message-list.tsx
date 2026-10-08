@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useSyncExternalStore } from "react";
+import React, { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { ChevronLeft } from "lucide-react";
 import { loadChatSessions, loadChatContacts, ChatSession, createOrGetSession, createGroupSession, pushChatMessage, addChatContact, loadChatMessages, getLastVisibleSessionMessage, getChatMessagePreview } from "@/lib/chat-storage";
 import { loadCharacters } from "@/lib/character-storage";
@@ -178,6 +178,55 @@ export function ChatMessageList({ onCloseApp, activeSession, onSelectSession, on
         setMergePrompt(null);
     };
 
+    // ── 会话列表的过滤 / 排序 ──────────────────────────────────────
+    // 以前这段是渲染体里的裸 IIFE：每次渲染都跑一遍，而且每个会话都要调到
+    // getSortedSessionMessages 去全库扫消息算预览——一次渲染 ~90 次全量扫描，
+    // 搜索框每敲一个字、每切一次 tab 都要重跑。现在过滤/排序进 useMemo（依赖
+    // 不变就整段跳过），列表项用 React.memo，预览读会话自身已存的 preview。
+    const allCharacters = loadCharacters();
+    const chatContacts = loadChatContacts();
+    const listKeyword = listFilter.trim().toLowerCase();
+
+    // 父组件传下来的回调每次渲染都是新函数，直接进 useMemo 依赖会让 memo 失效；
+    // 用 ref 转发，保证 handleSelectSession / handleSelectMascot 引用恒定。
+    const onSelectSessionRef = React.useRef(onSelectSession);
+    onSelectSessionRef.current = onSelectSession;
+    const onSelectMascotRef = React.useRef(onSelectMascot);
+    onSelectMascotRef.current = onSelectMascot;
+    const handleSelectSession = useCallback((session: ChatSession) => {
+        onSelectSessionRef.current(session);
+    }, []);
+    const handleSelectMascot = useCallback(() => {
+        onSelectMascotRef.current();
+    }, []);
+
+    const { showMascot, visibleSessions } = useMemo(() => {
+        const contactIds = new Set(chatContacts.map(c => c.characterId));
+        const mascotVisible = mascotSettings.chatEnabled
+            && listTab !== "group"
+            && (!listKeyword || (mascotSettings.nickname || "AI助手").toLowerCase().includes(listKeyword));
+        const matched = sessions
+            .filter(s => {
+                if (!(s.isGroup || contactIds.has(s.contactId))) return false;
+                if (!hasSessionListContent(s.id)) return false;
+                if (listTab === "private" && s.isGroup) return false;
+                if (listTab === "group" && !s.isGroup) return false;
+                if (!listKeyword) return true;
+                if (s.isGroup) return (s.groupName || "群聊").toLowerCase().includes(listKeyword);
+                const name = s.alias || allCharacters.find(c => c.id === s.contactId)?.name || "";
+                return name.toLowerCase().includes(listKeyword);
+            })
+            // 先把活跃时间算一次，避免排序比较器里反复算（原来是每比较一次算两个会话）
+            .map(session => ({ session, time: parseTime(getSessionListTime(session)) }))
+            .sort((a, b) => {
+                if (a.session.isPinned && !b.session.isPinned) return -1;
+                if (!a.session.isPinned && b.session.isPinned) return 1;
+                return b.time - a.time;
+            })
+            .map(entry => entry.session);
+        return { showMascot: mascotVisible, visibleSessions: matched };
+    }, [sessions, chatContacts, allCharacters, listKeyword, listTab, mascotSettings.chatEnabled, mascotSettings.nickname]);
+
     return (
         <div className="relative flex-1 h-full">
             <PageShell
@@ -278,58 +327,28 @@ export function ChatMessageList({ onCloseApp, activeSession, onSelectSession, on
                     ))}
                 </div>
                 <div className="px-5 pt-2 flex flex-col">
-                    {(() => {
-                            const contactIds = new Set(loadChatContacts().map(c => c.characterId));
-                            const allChars = loadCharacters();
-                            const keyword = listFilter.trim().toLowerCase();
-                            const showMascot = mascotSettings.chatEnabled
-                                && listTab !== "group"
-                                && (!keyword || (mascotSettings.nickname || "AI助手").toLowerCase().includes(keyword));
-                            const regularItems = [...sessions]
-                            .filter(s => {
-                                if (!(s.isGroup || contactIds.has(s.contactId))) return false;
-                                if (!hasSessionListContent(s.id)) return false;
-                                if (listTab === "private" && s.isGroup) return false;
-                                if (listTab === "group" && !s.isGroup) return false;
-                                if (!keyword) return true;
-                                if (s.isGroup) return (s.groupName || "群聊").toLowerCase().includes(keyword);
-                                const name = s.alias || allChars.find(c => c.id === s.contactId)?.name || "";
-                                return name.toLowerCase().includes(keyword);
-                            })
-                            .sort((a, b) => {
-                                if (a.isPinned && !b.isPinned) return -1;
-                                if (!a.isPinned && b.isPinned) return 1;
-                                const aTime = getSessionListTime(a);
-                                const bTime = getSessionListTime(b);
-                                return parseTime(bTime) - parseTime(aTime);
-                            })
-                            .map(s => (
+                    {!showMascot && visibleSessions.length === 0 ? (
+                        <div className="px-5 py-10 text-center text-[var(--c-icon)] ts-14">
+                            暂无聊天记录，点击右上角「+」发起聊天
+                        </div>
+                    ) : (
+                        <>
+                            {showMascot && (
+                                <MascotSessionItem
+                                    name={mascotSettings.nickname || "AI助手"}
+                                    avatarUrl={mascotAvatarUrl}
+                                    preview={getMascotLastPreview()}
+                                    isThinking={mascotChat.isThinking}
+                                    onSelect={onSelectMascot}
+                                />
+                            )}
+                            {visibleSessions.map(s => (
                                 <div key={s.id}>
-                                    <SessionItem session={s} onSelect={() => onSelectSession(s)} isPinned={!!s.isPinned} />
+                                    <SessionItem session={s} onSelectSession={handleSelectSession} isPinned={!!s.isPinned} />
                                 </div>
-                            ));
-                            if (!showMascot && regularItems.length === 0) {
-                                return (
-                                    <div className="px-5 py-10 text-center text-[var(--c-icon)] ts-14">
-                                        暂无聊天记录，点击右上角「+」发起聊天
-                                    </div>
-                                );
-                            }
-                            return (
-                                <>
-                                    {showMascot && (
-                                        <MascotSessionItem
-                                            name={mascotSettings.nickname || "AI助手"}
-                                            avatarUrl={mascotAvatarUrl}
-                                            preview={getMascotLastPreview()}
-                                            isThinking={mascotChat.isThinking}
-                                            onSelect={onSelectMascot}
-                                        />
-                                    )}
-                                    {regularItems}
-                                </>
-                            );
-                        })()}
+                            ))}
+                        </>
+                    )}
                 </div>
             </PageShell>
 
@@ -747,7 +766,8 @@ function ContactPicker({ onClose, onSelect }: { onClose: () => void; onSelect: (
     );
 }
 
-function SessionItem({ session, onSelect, isPinned }: { session: ChatSession, onSelect: () => void, isPinned?: boolean }) {
+// React.memo：会话对象没变就不重渲染，避免每次列表重渲染都重算每个会话的预览
+const SessionItem = React.memo(function SessionItem({ session, onSelectSession, isPinned }: { session: ChatSession, onSelectSession: (session: ChatSession) => void, isPinned?: boolean }) {
     const chars = loadCharacters();
     const character = chars.find(c => c.id === session.contactId);
     const lastVisibleMessage = getLastVisibleSessionMessage(session.id);
@@ -775,7 +795,7 @@ function SessionItem({ session, onSelect, isPinned }: { session: ChatSession, on
     return (
         <div
             className={`minimal-list-item${isPinned ? ' chat-pinned' : ''}`}
-            onClick={onSelect}
+            onClick={() => onSelectSession(session)}
         >
             {isGroup ? (
                 <div className="minimal-avatar-wrapper grid grid-cols-2 grid-rows-2 gap-[1px] p-[2px] bg-[var(--c-card-border)] rounded-full overflow-hidden">
@@ -819,4 +839,4 @@ function SessionItem({ session, onSelect, isPinned }: { session: ChatSession, on
             </div>
         </div>
     );
-}
+});
