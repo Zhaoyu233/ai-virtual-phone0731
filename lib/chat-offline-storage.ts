@@ -65,18 +65,41 @@ function normalizeTurn(value: unknown): ChatOfflineTurn | null {
     };
 }
 
-export function loadChatOfflineTurns(sessionId: string): ChatOfflineTurn[] {
+// 线下记录按「原始 JSON 串」缓存解析结果。单个会话的记录能有 13M+ 字符，
+// 解析 + 归一 + 排序一次在桌面要 20~55ms、手机 0.1~0.3s，而会话列表渲染和
+// prompt 装配都会反复读同一条记录。kvSet / kvRemove 会同步更新 kvGet 的返回值，
+// 所以比对原始串就能自动失效。
+const offlineTurnsCache = new Map<string, { raw: string; turns: ChatOfflineTurn[] }>();
+
+function loadChatOfflineTurnsCached(sessionId: string): ChatOfflineTurn[] {
+    let raw = "";
     try {
-        const raw = kvGet(storageKey(sessionId));
-        const parsed = raw ? JSON.parse(raw) as unknown : [];
-        if (!Array.isArray(parsed)) return [];
-        return parsed
-            .map(normalizeTurn)
-            .filter((turn): turn is ChatOfflineTurn => Boolean(turn))
-            .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        raw = kvGet(storageKey(sessionId)) || "";
     } catch {
         return [];
     }
+    if (!raw) return [];
+    const cached = offlineTurnsCache.get(sessionId);
+    if (cached && cached.raw === raw) return cached.turns;
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        const turns = Array.isArray(parsed)
+            ? parsed
+                .map(normalizeTurn)
+                .filter((turn): turn is ChatOfflineTurn => Boolean(turn))
+                .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+            : [];
+        offlineTurnsCache.set(sessionId, { raw, turns });
+        return turns;
+    } catch {
+        offlineTurnsCache.set(sessionId, { raw, turns: [] });
+        return [];
+    }
+}
+
+export function loadChatOfflineTurns(sessionId: string): ChatOfflineTurn[] {
+    // 返回副本：调用方可以自由增删排序，不会污染缓存
+    return loadChatOfflineTurnsCached(sessionId).slice();
 }
 
 export function saveChatOfflineTurns(sessionId: string, turns: ChatOfflineTurn[]): void {
@@ -178,7 +201,7 @@ export function loadChatOfflineProjectionEntries(
     for (const session of sessions) {
         for (const turn of loadChatOfflineTurns(session.id)) {
             if (options?.afterTimestamp && turn.createdAt <= options.afterTimestamp) continue;
-            const summaryText = compactProjectionText(turn.summary, 500);
+            const summaryText = compactTurnSummary(turn);
             if (!summaryText) continue;
             const ts = formatChatTimestamp(turn.createdAt);
             entries.push({
@@ -192,6 +215,18 @@ export function loadChatOfflineProjectionEntries(
     }
 
     return entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+}
+
+// 摘要清洗（正则 + 截断）每次装配 prompt 都要为全部线下轮跑一遍；turn 现在是
+// 缓存里稳定的对象引用，用 WeakMap 记住结果即可。
+const projectionSummaryCache = new WeakMap<ChatOfflineTurn, string>();
+
+function compactTurnSummary(turn: ChatOfflineTurn): string {
+    const cached = projectionSummaryCache.get(turn);
+    if (cached !== undefined) return cached;
+    const text = compactProjectionText(turn.summary, 500);
+    projectionSummaryCache.set(turn, text);
+    return text;
 }
 
 function escapeTagName(tag: string): string {
@@ -244,23 +279,10 @@ export function parseOfflineResponse(rawText: string, summaryTag: string): Parse
 }
 
 // ── 聊天列表用：最后一条线下记录 ─────────────────────────────
-// 聊天列表在每次渲染时都会逐会话读取，这里按原始 JSON 串缓存解析结果，
-// 避免把整段线下记录反复 parse。
-const lastTurnCache = new Map<string, { raw: string; turn: ChatOfflineTurn | null }>();
-
+// 记录已按原始串缓存，取最后一条直接读缓存即可（turns 按时间升序）。
 export function getLastChatOfflineTurn(sessionId: string): ChatOfflineTurn | null {
-    let raw = "";
-    try {
-        raw = kvGet(storageKey(sessionId)) || "";
-    } catch {
-        return null;
-    }
-    const cached = lastTurnCache.get(sessionId);
-    if (cached && cached.raw === raw) return cached.turn;
-    const turns = raw ? loadChatOfflineTurns(sessionId) : [];
-    const turn = turns.length ? turns[turns.length - 1] : null;
-    lastTurnCache.set(sessionId, { raw, turn });
-    return turn;
+    const turns = loadChatOfflineTurnsCached(sessionId);
+    return turns.length ? turns[turns.length - 1] : null;
 }
 
 // 线下记录没有普通消息那样的 preview 字段，这里从摘要/正文里压一条出来，

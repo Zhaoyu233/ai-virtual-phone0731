@@ -473,10 +473,42 @@ export function compareChatMessages(a: ChatMessage, b: ChatMessage): number {
     return a.id.localeCompare(b.id);
 }
 
+// ── 按会话缓存的已排序消息索引 ──────────────────────────────
+// getSortedSessionMessages 过去每次调用都要把整张消息表 filter + sort 一遍。
+// 会话列表渲染一次要调 ~90 次，消息上万条时这个 O(条数 × 调用次数) 会把主线程
+// 占满（表现就是点什么都卡死）。这里按会话缓存排序结果，用「数组身份 + 长度 +
+// 显式脏标记」三重校验失效：长度变化（push/splice/filter/map）和数组被整体替换
+// 都能自动发现，唯一发现不了的是「原地替换某个元素」，那由 markChatMessagesDirty
+// 显式标记。
+let _sortedSessionMessages = new Map<string, ChatMessage[]>();
+let _sortedSessionRef: ChatMessage[] | null = null;
+let _sortedSessionRefLength = -1;
+let _messagesDirtyToken = 0;
+let _sortedSessionDirtyToken = -1;
+
+/** 消息对象被原地替换（身份和长度都不变）时调用，使按会话排序的缓存失效。 */
+export function markChatMessagesDirty(): void {
+    _messagesDirtyToken += 1;
+}
+
 function getSortedSessionMessages(sessionId: string): ChatMessage[] {
-    return _loadAllMessages()
+    if (
+        _sortedSessionRef !== _messagesCache
+        || _sortedSessionRefLength !== _messagesCache.length
+        || _sortedSessionDirtyToken !== _messagesDirtyToken
+    ) {
+        _sortedSessionMessages.clear();
+        _sortedSessionRef = _messagesCache;
+        _sortedSessionRefLength = _messagesCache.length;
+        _sortedSessionDirtyToken = _messagesDirtyToken;
+    }
+    const cached = _sortedSessionMessages.get(sessionId);
+    if (cached) return cached;
+    const sorted = _messagesCache
         .filter(m => m.sessionId === sessionId)
         .sort(compareChatMessages);
+    _sortedSessionMessages.set(sessionId, sorted);
+    return sorted;
 }
 
 function getNextMessageOrder(sessionId: string): number {
@@ -1129,7 +1161,8 @@ export function reassignChatSessionMessages(fromSessionId: string, toSessionId: 
 export function loadChatMessages(sessionId: string, limit?: number): ChatMessage[] {
     const all = getSortedSessionMessages(sessionId);
     if (limit && limit < all.length) return all.slice(-limit);
-    return all;
+    // 返回副本：调用方可以自由 sort/splice，不会污染按会话排序的缓存
+    return all.slice();
 }
 
 function createMessageId(): string {
@@ -1531,6 +1564,7 @@ export function editChatMessage(messageId: string, newContent: string) {
     const msgIdx = _messagesCache.findIndex(m => m.id === messageId);
     if (msgIdx !== -1) {
         _messagesCache[msgIdx] = { ..._messagesCache[msgIdx], content: newContent };
+        markChatMessagesDirty();
         dbPutMessage(_messagesCache[msgIdx]);
 
         const sessionId = _messagesCache[msgIdx].sessionId;
@@ -1549,6 +1583,7 @@ export function retractChatMessage(messageId: string) {
     const msgIdx = _messagesCache.findIndex(m => m.id === messageId);
     if (msgIdx !== -1) {
         _messagesCache[msgIdx] = { ..._messagesCache[msgIdx], isRetracted: true };
+        markChatMessagesDirty();
         dbPutMessage(_messagesCache[msgIdx]);
 
         const sessionId = _messagesCache[msgIdx].sessionId;
@@ -1741,6 +1776,7 @@ export function updateMessageMediaStatus(messageId: string, newStatus: "pending"
     const idx = _messagesCache.findIndex(m => m.id === messageId);
     if (idx !== -1) {
         _messagesCache[idx] = { ..._messagesCache[idx], mediaData: { ..._messagesCache[idx].mediaData, status: newStatus } };
+        markChatMessagesDirty();
         dbPutMessage(_messagesCache[idx]);
     }
 }
@@ -1750,6 +1786,7 @@ export function updateMessageMediaData(messageId: string, data: ChatMessage["med
     const idx = _messagesCache.findIndex(m => m.id === messageId);
     if (idx !== -1) {
         _messagesCache[idx] = { ..._messagesCache[idx], mediaData: data };
+        markChatMessagesDirty();
         dbPutMessage(_messagesCache[idx]);
     }
 }
@@ -1758,6 +1795,7 @@ export function updateMessageMediaUrl(messageId: string, mediaUrl: string) {
     const idx = _messagesCache.findIndex(m => m.id === messageId);
     if (idx !== -1) {
         _messagesCache[idx] = { ..._messagesCache[idx], mediaUrl };
+        markChatMessagesDirty();
         dbPutMessage(_messagesCache[idx]);
     }
 }
@@ -1780,6 +1818,7 @@ export async function persistMessageVoiceAudio(
             mediaData: { ..._messagesCache[idx].mediaData, synthesizedFromText },
         };
         _messagesCache[idx] = next;
+        markChatMessagesDirty();
         dbPutMessage(next);
         return;
     }
@@ -1805,6 +1844,7 @@ export function updateChatMessage(
     if (idx === -1) return null;
 
     _messagesCache[idx] = { ..._messagesCache[idx], ...patch };
+    markChatMessagesDirty();
     const updated = _messagesCache[idx];
     dbPutMessage(updated);
 
