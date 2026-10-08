@@ -44,3 +44,30 @@
   --font-size-lg: 17px;  --font-size-xl: 20px;
   --font-size-2xl: 24px; --font-size-3xl: 30px;
 }
+
+/* ── 手机轻量模式 ────────────────────────────────────────────────────
+   毛玻璃（backdrop-filter）是这个 UI 的主体样式，全站 390+ 处。桌面端很便宜，
+   手机上却是「每次重绘都要重新采样整屏」；叠上十几层之后，一次合成就要几百
+   毫秒，表现为整个页面点不动。触屏/窄屏设备上把毛玻璃与过饱和降级成普通半
+   透明底：观感几乎不变（底色本身就接近不透明），合成开销降一个数量级。 */
+@media (pointer: coarse) and (max-width: 1024px) {
+  :root {
+    --ui-blur: 0px;
+    --ui-blur-light: 0px;
+    --ui-blur-heavy: 0px;
+    --ui-blur-icon: 0px;
+    --ui-saturate: 100%;
+  }
+
+  *,
+  *::before,
+  *::after {
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+
+  /* 关掉模糊后没有内容需要在背后实时采样，持续留一块合成层只是白烧显存 */
+  .phone-shell {
+    will-change: auto;
+  }
+}

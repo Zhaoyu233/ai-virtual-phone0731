@@ -1,6 +1,6 @@
 "use client";
 
-import { forwardRef, Fragment, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, Fragment, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ChatSession, ChatMessage, CHAT_APP_SETTINGS_UPDATED_EVENT, CHAT_INITIAL_VISIBLE_MESSAGE_COUNT, CHAT_LOAD_MORE_MESSAGE_COUNT, CHAT_REQUEST_REPLY_EVENT, loadChatAppSettings, loadChatMessages, loadChatContacts, loadChatSessions, saveChatSessions, pushChatMessage, updateChatMessage, deleteChatMessage, deleteChatMessagesFrom, deleteChatMessagesByIds, retractChatMessage, editChatMessage, updateMessageMediaData, replaceResponseBatchWithParts, replaceGroupResponseRound, isReadingDiscussMessage, isSystemInstructionMessage, createResponseBatchId, createResponseRoundId, getLatestStateValues, getLatestCharacterStateValues, compareChatMessages, isSessionStreamingEnabled } from "@/lib/chat-storage";
 import { cleanStreamText, splitStreamPreviewSegments, stripLiteralTexts, stripXmlTagBlocks } from "@/lib/stream-preview";
 import type { StateValue } from "@/lib/chat-storage";
@@ -1077,6 +1077,158 @@ const OfflineTextInputBar = memo(forwardRef<OfflineTextInputHandle, {
     );
 }));
 
+// ── 流式预览的外部 store ──────────────────────────────────────────
+// 为什么不用 useState：预览每秒要更新几十次（rAF 合帧后仍是每帧一次）。状态
+// 放在 ChatRoom 里意味着每帧都要把整个 ChatRoom（6000 行、几十个 useMemo）
+// 重渲染一遍；桌面端勉强扛得住，移动端主线程被占满——表现就是「开始生成回复
+// 后除了上下滑动什么都点不动」。放到下面的 store 后，只有订阅预览的两个小组件
+// 重渲染，ChatRoom 在生成期间不再逐帧刷新。
+type ChatStreamPreviewPayload = {
+    /** 单聊：按空行定型的分段气泡列表，最后一段在打字 */
+    texts?: string[];
+    /** 群聊：按角色分组的段落 */
+    parts?: { characterId: string; characterName: string; texts: string[] }[];
+};
+type OfflineStreamPreviewPayload = { content: string; summary: string };
+type ChatStreamPreviewState = (ChatStreamPreviewPayload & { sessionId: string }) | null;
+type OfflineStreamPreviewState = (OfflineStreamPreviewPayload & { sessionId: string }) | null;
+
+type StreamPreviewListener = () => void;
+
+function createStreamPreviewStore<T>(initial: T) {
+    let snapshot: T = initial;
+    const listeners = new Set<StreamPreviewListener>();
+    return {
+        getSnapshot: (): T => snapshot,
+        // 服务端渲染期间永远拿初始值：预览是纯客户端行为
+        getServerSnapshot: (): T => initial,
+        set(next: T): void {
+            if (Object.is(next, snapshot)) return;
+            snapshot = next;
+            for (const listener of Array.from(listeners)) listener();
+        },
+        subscribe(listener: StreamPreviewListener): () => void {
+            listeners.add(listener);
+            return () => {
+                listeners.delete(listener);
+            };
+        },
+    };
+}
+
+// sessionId 一起存：多个 ChatRoom 可能同时挂着，订阅方只认自己那个会话的预览，
+// 避免 A 会话生成时 B 会话也长出预览气泡。
+const chatStreamPreviewStore = createStreamPreviewStore<ChatStreamPreviewState>(null);
+const offlineStreamPreviewStore = createStreamPreviewStore<OfflineStreamPreviewState>(null);
+
+// 线上流式预览：唯一订阅 chatStreamPreviewStore 的地方，只重渲染这一小块
+const ChatStreamPreview = memo(function ChatStreamPreview({
+    session,
+    character,
+    groupCharMap,
+}: {
+    session: ChatSession;
+    character: Character | null;
+    groupCharMap: Map<string, Character>;
+}) {
+    const preview = useSyncExternalStore(
+        chatStreamPreviewStore.subscribe,
+        chatStreamPreviewStore.getSnapshot,
+        chatStreamPreviewStore.getServerSnapshot,
+    );
+    if (!preview || preview.sessionId !== session.id) return null;
+    return (
+        <div className="chat-stream-preview" data-ui="stream-preview">
+            {session.isGroup && preview.parts && preview.parts.length > 0 ? (
+                /* 按空行定型：写完的段落立即成为独立气泡（与最终拆条同规则），只有最后一段带光标打字 */
+                preview.parts.map((part, i) => {
+                    const senderChar = groupCharMap.get(part.characterId) || character;
+                    const isLastPart = i === (preview.parts?.length ?? 0) - 1;
+                    return part.texts.map((segText, j) => {
+                        const isTyping = isLastPart && j === part.texts.length - 1;
+                        return (
+                            <div key={`stream-${part.characterId}-${i}-${j}`} className="chat-msg-wrapper" data-role="assistant">
+                                <div className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0">
+                                    <div className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden">
+                                        {senderChar?.avatar ? <img src={senderChar.avatar} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
+                                    </div>
+                                </div>
+                                <div className="chat-msg-content-wrap flex flex-col min-w-0 max-w-[70%]">
+                                    <span className="chat-group-sender-name">{part.characterName}</span>
+                                    <div className="chat-bubble-role-assistant chat-stream-bubble break-words rounded-md px-3 py-2">
+                                        {/* 流式预览用轻量 pre-wrap 渲染：避免每帧跑 markdown/双语解析导致闪烁卡顿 */}
+                                        <div className="chat-stream-text whitespace-pre-wrap break-words">{segText}</div>
+                                        {isTyping && <span className="chat-stream-cursor" aria-hidden="true" />}
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    });
+                })
+            ) : preview.texts && preview.texts.length > 0 ? (
+                preview.texts.map((segText, j) => {
+                    const isTyping = j === (preview.texts?.length ?? 0) - 1;
+                    return (
+                        <div key={`stream-seg-${j}`} className="chat-msg-wrapper" data-role="assistant">
+                            <div className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0">
+                                <div className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden">
+                                    {character?.avatar ? <img src={character.avatar} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
+                                </div>
+                            </div>
+                            <div className="chat-msg-content-wrap flex flex-col min-w-0 max-w-[70%]">
+                                <div className="chat-bubble-role-assistant chat-stream-bubble break-words rounded-md px-3 py-2">
+                                    {/* 流式预览用轻量 pre-wrap 渲染：避免每帧跑 markdown/双语解析导致闪烁卡顿 */}
+                                    <div className="chat-stream-text whitespace-pre-wrap break-words">{segText}</div>
+                                    {isTyping && <span className="chat-stream-cursor" aria-hidden="true" />}
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })
+            ) : null}
+        </div>
+    );
+});
+
+// 线下流式预览：同理，只订阅 offlineStreamPreviewStore
+const OfflineStreamPreviewEntry = memo(function OfflineStreamPreviewEntry({
+    session,
+    character,
+}: {
+    session: ChatSession;
+    character: Character | null;
+}) {
+    const preview = useSyncExternalStore(
+        offlineStreamPreviewStore.subscribe,
+        offlineStreamPreviewStore.getSnapshot,
+        offlineStreamPreviewStore.getServerSnapshot,
+    );
+    // 预览内容为空时仍要渲染「线下回复生成中」占位（与旧行为一致）；
+    // 只有拿到别的会话的预览才什么都不画。
+    if (preview && preview.sessionId !== session.id) return null;
+    return (
+        preview?.content ? (
+            /* 流式预览原地长出：与正式剧情正文同结构（头像/角色名/正文区），
+               正文用轻量 pre-wrap 渲染（避免每帧 markdown/双语解析），落库时原地换成正式排版 */
+            <div className="chat-offline-entry" data-role="assistant">
+                <div className="chat-offline-avatar" aria-hidden="true">
+                    {character?.avatar ? <img src={character.avatar} alt="" /> : <ChatFallbackAvatar />}
+                </div>
+                <div className="chat-offline-label-row">
+                    <div className="chat-offline-label">{session.isGroup ? (session.groupName || "群聊") : (character?.name || "对方")}</div>
+                </div>
+                <div className="chat-offline-text">
+                    <div className="chat-stream-text whitespace-pre-wrap break-words">{preview.content}</div>
+                    <span className="chat-stream-cursor" aria-hidden="true" />
+                </div>
+            </div>
+        ) : (
+            <div className="chat-offline-generating">
+                <span>线下回复生成中</span>
+            </div>
+        )
+    );
+});
 export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     const [liveCSS, setLiveCSS] = useState(session.customCSS || "");
     const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -1093,13 +1245,17 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     const [offlineVisibleCount, setOfflineVisibleCount] = useState(OFFLINE_INITIAL_LOAD);
     const [pendingOfflineUserText, setPendingOfflineUserText] = useState("");
     const [isOfflineGenerating, setIsOfflineGenerating] = useState(false);
-    // 流式生成预览：线上（单聊/群聊）与线下各一份，生成中实时刷新，结束后清空
-    const [streamPreview, setStreamPreview] = useState<null | {
-        /** 单聊：按空行定型的分段气泡列表，最后一段在打字 */
-        texts?: string[];
-        parts?: { characterId: string; characterName: string; texts: string[] }[];
-    }>(null);
-    const [offlineStreamPreview, setOfflineStreamPreview] = useState<null | { content: string; summary: string }>(null);
+    // 流式生成预览：线上（单聊/群聊）与线下各一份，生成中实时刷新，结束后清空。
+    // ⚠️ 这两份预览每秒要被刷新几十次。以前它们放在本组件的 state 里，于是一次
+    // 刷新就要把整个 ChatRoom（6000 行、几十个 useMemo）重渲染一遍——生成期间
+    // 主线程被占满，手机上就表现为「开始生成后除了上下滑动什么都点不动」。
+    // 现在改放进 lib/stream-preview-store.ts：只有订阅它的预览组件重渲染。
+    const setStreamPreview = useCallback((value: ChatStreamPreviewPayload | null) => {
+        chatStreamPreviewStore.set(value ? { ...value, sessionId: session.id } : null);
+    }, [session.id]);
+    const setOfflineStreamPreview = useCallback((value: OfflineStreamPreviewPayload | null) => {
+        offlineStreamPreviewStore.set(value ? { ...value, sessionId: session.id } : null);
+    }, [session.id]);
     const streamAccumRef = useRef("");
     const offlineStreamAccumRef = useRef("");
     // 群聊/单聊流式预览解析的 rAF 合并帧（限频：一帧最多解析一次全文）
@@ -2058,12 +2214,19 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             if (el) el.scrollTop = el.scrollHeight;
         });
     }, []);
+    // 流式预览刷新时自动跟到底部：直接订阅 store，不再依赖本组件重渲染
     useLayoutEffect(() => {
-        if (!streamPreview && !offlineStreamPreview) return;
-        followStreamScroll();
-    }, [streamPreview, offlineStreamPreview, offlineMode, followStreamScroll]);
+        const follow = () => followStreamScroll();
+        const unsubscribeOnline = chatStreamPreviewStore.subscribe(follow);
+        const unsubscribeOffline = offlineStreamPreviewStore.subscribe(follow);
+        return () => {
+            unsubscribeOnline();
+            unsubscribeOffline();
+        };
+    }, [followStreamScroll]);
 
-    // 卸载时清理挂起的流式预览 rAF 帧，防止切会话后回调残留触发 setState
+    // 卸载时清理挂起的流式预览 rAF 帧，防止切会话后回调残留触发 setState；
+    // 并把属于本会话的预览从全局 store 里清掉（store 不随组件卸载消失）
     useEffect(() => {
         return () => {
             if (streamParseFrameRef.current) cancelAnimationFrame(streamParseFrameRef.current);
@@ -2072,8 +2235,10 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             streamParseFrameRef.current = 0;
             offlineStreamFrameRef.current = 0;
             streamFollowRef.current = 0;
+            if (chatStreamPreviewStore.getSnapshot()?.sessionId === session.id) chatStreamPreviewStore.set(null);
+            if (offlineStreamPreviewStore.getSnapshot()?.sessionId === session.id) offlineStreamPreviewStore.set(null);
         };
-    }, []);
+    }, [session.id]);
 
     // Sync current session+messages to debug store for DebugPromptPanel
     useEffect(() => {
@@ -5620,26 +5785,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                         />
                                     </div>
                                 </div>
-                                {offlineStreamPreview?.content ? (
-                                    /* 流式预览原地长出：与正式剧情正文同结构（头像/角色名/正文区），
-                                       正文用轻量 pre-wrap 渲染（避免每帧 markdown/双语解析），落库时原地换成正式排版 */
-                                    <div className="chat-offline-entry" data-role="assistant">
-                                        <div className="chat-offline-avatar" aria-hidden="true">
-                                            {character?.avatar ? <img src={character.avatar} alt="" /> : <ChatFallbackAvatar />}
-                                        </div>
-                                        <div className="chat-offline-label-row">
-                                            <div className="chat-offline-label">{session.isGroup ? (session.groupName || "群聊") : (character?.name || "对方")}</div>
-                                        </div>
-                                        <div className="chat-offline-text">
-                                            <div className="chat-stream-text whitespace-pre-wrap break-words">{offlineStreamPreview.content}</div>
-                                            <span className="chat-stream-cursor" aria-hidden="true" />
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <div className="chat-offline-generating">
-                                        <span>线下回复生成中</span>
-                                    </div>
-                                )}
+                                {<OfflineStreamPreviewEntry session={session} character={character} />}
                             </div>
                         )}
                     </div>
@@ -6122,57 +6268,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     );
                 })}
                 {/* 流式生成预览：生成中实时显示原文增量，结束后由正式消息替换 */}
-                {!offlineMode && streamPreview && (
-                    <div className="chat-stream-preview" data-ui="stream-preview">
-                        {session.isGroup && streamPreview.parts && streamPreview.parts.length > 0 ? (
-                            /* 按空行定型：写完的段落立即成为独立气泡（与最终拆条同规则），只有最后一段带光标打字 */
-                            streamPreview.parts.map((part, i) => {
-                                const senderChar = groupCharMap.get(part.characterId) || character;
-                                const isLastPart = i === (streamPreview.parts?.length ?? 0) - 1;
-                                return part.texts.map((segText, j) => {
-                                    const isTyping = isLastPart && j === part.texts.length - 1;
-                                    return (
-                                        <div key={`stream-${part.characterId}-${i}-${j}`} className="chat-msg-wrapper" data-role="assistant">
-                                            <div className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0">
-                                                <div className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden">
-                                                    {senderChar?.avatar ? <img src={senderChar.avatar} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
-                                                </div>
-                                            </div>
-                                            <div className="chat-msg-content-wrap flex flex-col min-w-0 max-w-[70%]">
-                                                <span className="chat-group-sender-name">{part.characterName}</span>
-                                                <div className="chat-bubble-role-assistant chat-stream-bubble break-words rounded-md px-3 py-2">
-                                                    {/* 流式预览用轻量 pre-wrap 渲染：避免每帧跑 markdown/双语解析导致闪烁卡顿 */}
-                                                    <div className="chat-stream-text whitespace-pre-wrap break-words">{segText}</div>
-                                                    {isTyping && <span className="chat-stream-cursor" aria-hidden="true" />}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    );
-                                });
-                            })
-                        ) : streamPreview.texts && streamPreview.texts.length > 0 ? (
-                            streamPreview.texts.map((segText, j) => {
-                                const isTyping = j === (streamPreview.texts?.length ?? 0) - 1;
-                                return (
-                                    <div key={`stream-seg-${j}`} className="chat-msg-wrapper" data-role="assistant">
-                                        <div className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0">
-                                            <div className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden">
-                                                {character?.avatar ? <img src={character.avatar} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
-                                            </div>
-                                        </div>
-                                        <div className="chat-msg-content-wrap flex flex-col min-w-0 max-w-[70%]">
-                                            <div className="chat-bubble-role-assistant chat-stream-bubble break-words rounded-md px-3 py-2">
-                                                {/* 流式预览用轻量 pre-wrap 渲染：避免每帧跑 markdown/双语解析导致闪烁卡顿 */}
-                                                <div className="chat-stream-text whitespace-pre-wrap break-words">{segText}</div>
-                                                {isTyping && <span className="chat-stream-cursor" aria-hidden="true" />}
-                                            </div>
-                                        </div>
-                                    </div>
-                                );
-                            })
-                        ) : null}
-                    </div>
-                )}
+                {!offlineMode && <ChatStreamPreview session={session} character={character} groupCharMap={groupCharMap} />}
                 {/* Scroll anchor: browser keeps this in view when content above changes height */}
                 <div style={{ overflowAnchor: 'auto', height: 1 }} />
             </div>
