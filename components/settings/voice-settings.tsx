@@ -183,11 +183,15 @@ const DEFAULT_ELEVENLABS_VOICES = [
     { id: "AZnzlk1XvdvUeBnXmlld", name: "Domi" },
 ];
 
+// 模型列表取自 ElevenLabs GET /v1/models：v4 是当前最新模型（支持 90+ 语言），
+// v4_turbo 是同代低延迟版本。列表里没有的模型仍可用「手动输入」直接填 ID。
 const DEFAULT_ELEVENLABS_MODELS = [
-    { id: "eleven_multilingual_v2", name: "eleven_multilingual_v2（多语言·推荐）" },
+    { id: "eleven_v4", name: "eleven_v4（最新·情绪最丰富）" },
+    { id: "eleven_v4_turbo", name: "eleven_v4_turbo（最新·低延迟）" },
+    { id: "eleven_multilingual_v2", name: "eleven_multilingual_v2（多语言·稳定）" },
     { id: "eleven_turbo_v2_5", name: "eleven_turbo_v2_5（低延迟）" },
     { id: "eleven_flash_v2_5", name: "eleven_flash_v2_5（极速）" },
-    { id: "eleven_v3", name: "eleven_v3（Alpha）" },
+    { id: "eleven_v3", name: "eleven_v3（支持 Audio Tags）" },
 ];
 
 type VoiceOption = { id: string; name: string; createdAt?: number };
@@ -342,7 +346,7 @@ export function VoiceSettings() {
             updateConfig(id, {
                 provider: "ElevenLabs",
                 baseUrl: "https://api.elevenlabs.io/v1",
-                model: "eleven_multilingual_v2",
+                model: "eleven_v4",
                 defaultVoice: "21m00Tcm4TlvDq8ikWAM",
             });
             setManualModelIds(prev => ({ ...prev, [id]: false }));
