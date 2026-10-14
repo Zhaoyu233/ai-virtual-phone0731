@@ -46,6 +46,8 @@ import {
   generateStoryCompletion,
   getStoryRenderSignature,
   rebuildStorySessionRenderCache,
+  buildStoryStreamPreview,
+  buildStoryResultFromRawText,
 } from "@/lib/story-engine";
 import {
   createOrGetStorySession,
@@ -56,11 +58,13 @@ import {
   deleteStoryMessage,
   deleteStoryMessagesFrom,
   editStoryMessage,
+  isStoryStreamingEnabled,
   type StoryMessage,
   type StorySession,
   updateStorySession,
 } from "@/lib/story-storage";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
+import { Toggle } from "@/components/ui/form";
 import { STORY_CSS_EXAMPLE } from "@/lib/css-examples";
 import { applyEditOutputRegex } from "@/lib/llm-prompt-assembler";
 import { MacroEngine } from "@/lib/macro-engine";
@@ -155,12 +159,16 @@ const STORY_LOAD_MORE_COUNT = 10;
 function StoryGeneratingIndicator({
   characterName,
   avatar,
+  previewText,
 }: {
   characterName: string;
   avatar?: string;
+  /** 流式接收到的正文（已净化）：非空时气泡里实时长出正文，而不是只转圈 */
+  previewText?: string | null;
 }) {
   const [statusIndex, setStatusIndex] = useState(0);
   const status = STORY_GENERATION_STATUS[statusIndex % STORY_GENERATION_STATUS.length];
+  const preview = previewText?.trim() ? previewText : "";
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -181,14 +189,23 @@ function StoryGeneratingIndicator({
         </div>
       </div>
       <div className="story-bubble-wrap">
-        <div className="story-bubble story-generating-bubble" aria-label="正在生成剧情">
-          <span className="story-generating-copy">{status}</span>
-          <span className="story-generating-dots" aria-hidden="true">
-            <i />
-            <i />
-            <i />
-          </span>
-        </div>
+        {preview ? (
+          <div className="story-bubble story-generating-bubble story-generating-bubble--stream" aria-label="正在生成剧情">
+            <div className="story-generating-stream">
+              {preview}
+              <span className="story-generating-caret" aria-hidden="true" />
+            </div>
+          </div>
+        ) : (
+          <div className="story-bubble story-generating-bubble" aria-label="正在生成剧情">
+            <span className="story-generating-copy">{status}</span>
+            <span className="story-generating-dots" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
+          </div>
+        )}
       </div>
     </article>
   );
@@ -282,6 +299,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const [customCssDraft, setCustomCssDraft] = useState("");
   const [foldTagsDraft, setFoldTagsDraft] = useState("");
   const [contextExcludedTagsDraft, setContextExcludedTagsDraft] = useState("");
+  // 流式接收：增量先攒在 ref 里，每帧只把「净化后的预览」推一次 state——
+  // 逐 token setState 会让整页（剧情页很长）以 token 频率重渲染，直接卡死
+  const [streamPreview, setStreamPreview] = useState<string | null>(null);
   // 生成状态按会话记录：避免在 A 会话生成时切到 B 会话也显示"正在生成"
   const [generatingSessionIds, setGeneratingSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   // 抽屉滑动手势用 ref 而不是 state：手指按住时 touchmove 每帧都在触发，
@@ -304,6 +324,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressTriggeredRef = useRef(false);
   const startPosRef = useRef<{ x: number; y: number } | null>(null);
+  const streamRawRef = useRef("");
+  const streamPaintFrameRef = useRef(0);
 
   const characters = useMemo(() => loadCharacters(), []);
   const userIdentity = useMemo(
@@ -331,10 +353,65 @@ export function StoryApp({ onClose }: StoryAppProps) {
     });
   }, []);
 
+  const streamingEnabled = isStoryStreamingEnabled(currentSession);
+
+  /** 收到一次流式增量：攒进 ref，按帧节流地刷新预览（净化掉思维链/摘要块） */
+  const collectStoryStreamDelta = useCallback((delta: string, foldTags?: string) => {
+    streamRawRef.current += delta;
+    if (streamPaintFrameRef.current) return;
+    streamPaintFrameRef.current = requestAnimationFrame(() => {
+      streamPaintFrameRef.current = 0;
+      setStreamPreview(buildStoryStreamPreview(streamRawRef.current, foldTags));
+    });
+  }, []);
+
+  const resetStoryStream = useCallback(() => {
+    streamRawRef.current = "";
+    if (streamPaintFrameRef.current) {
+      cancelAnimationFrame(streamPaintFrameRef.current);
+      streamPaintFrameRef.current = 0;
+    }
+    setStreamPreview(null);
+  }, []);
+
+  /**
+   * 流式收到一半就断了（超时 / 网关掐流 / 模型截断），或用户点了停止：把已经流出来的原文
+   * 按截断内容落库——API 是花了钱的，截断就截断，不撤回、也不重发请求补一遍。
+   * 返回是否真的写入了消息。
+   */
+  const commitStoryStreamPartial = useCallback((sessionId: string, characterId: string, foldTags?: string): boolean => {
+    const rawText = streamRawRef.current;
+    if (!rawText.trim() || !mountedRef.current) return false;
+    try {
+      const result = buildStoryResultFromRawText(characterId, rawText, { sessionFoldTags: foldTags });
+      pushStoryMessage({
+        sessionId,
+        role: "assistant",
+        rawContent: result.rawText,
+        renderedContent: result.renderedText,
+        storySummary: result.storySummary,
+        regexSignature: result.regexSignature,
+        parserVersion: result.parserVersion,
+      });
+      if (activeSessionIdRef.current === sessionId) {
+        setMessages(loadStoryMessages(sessionId));
+      }
+      setStorageVersion((value) => value + 1);
+      return true;
+    } catch (error) {
+      console.warn("[StoryApp] 截断正文落库失败:", error);
+      return false;
+    }
+  }, []);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      if (streamPaintFrameRef.current) {
+        cancelAnimationFrame(streamPaintFrameRef.current);
+        streamPaintFrameRef.current = 0;
+      }
       if (activeSessionIdRef.current) {
         cancelStoryGenerationRun(activeSessionIdRef.current);
       }
@@ -623,16 +700,20 @@ export function StoryApp({ onClose }: StoryAppProps) {
     setMessages((prev) => [...prev, userMessage]);
     setStorageVersion((value) => value + 1);
     markGenerating(sessionId, true);
+    resetStoryStream();
     const generationRun = createStoryGenerationRun(sessionId);
     const generationRunId = generationRun.runId;
     const isCurrentGeneration = () => mountedRef.current && isStoryGenerationRunActive(sessionId, generationRunId);
 
     try {
       const historyForGeneration = loadStoryMessages(sessionId);
+      const foldTags = currentSession?.foldTags;
       const result = await generateStoryCompletion(characterId, historyForGeneration, {
-        sessionFoldTags: currentSession?.foldTags,
+        sessionFoldTags: foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
         signal: generationRun.controller.signal,
+        streaming: streamingEnabled,
+        onDelta: (delta) => collectStoryStreamDelta(delta, foldTags),
       });
       if (!isCurrentGeneration()) return;
       const assistantMessage = pushStoryMessage({
@@ -662,8 +743,14 @@ export function StoryApp({ onClose }: StoryAppProps) {
         })();
       }
     } catch (error) {
-      if (!isCurrentGeneration() || isAbortLikeError(error)) return;
-      const errText = error instanceof Error ? error.message : "剧情生成失败，请稍后再试。";
+      // 已经流出来的正文先落库：中途断流 / 用户停止都算截断，钱花了就留下，不撤回
+      const committedPartial = commitStoryStreamPartial(sessionId, characterId, currentSession?.foldTags);
+      if (isAbortLikeError(error) || committedPartial) return;
+      if (!isCurrentGeneration()) return;
+      const baseMessage = error instanceof Error ? error.message : "剧情生成失败，请稍后再试。";
+      const errText = streamingEnabled
+        ? `${baseMessage}\n（若中转不支持流式，可在剧情侧栏关闭「剧情流式生成」改用整段请求）`
+        : baseMessage;
       const systemMessage = pushStoryMessage({
         sessionId,
         role: "system",
@@ -678,6 +765,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
       if (finishStoryGenerationRun(sessionId, generationRunId)) {
         markGenerating(sessionId, false);
       }
+      resetStoryStream();
     }
   }
 
@@ -832,14 +920,18 @@ export function StoryApp({ onClose }: StoryAppProps) {
     autoBottomLockRef.current = true;
     requestAnimationFrame(() => scrollStoryToBottom());
     markGenerating(sessionId, true);
+    resetStoryStream();
     const generationRun = createStoryGenerationRun(sessionId);
     const generationRunId = generationRun.runId;
     const isCurrentGeneration = () => mountedRef.current && isStoryGenerationRunActive(sessionId, generationRunId);
     try {
+      const foldTags = currentSession?.foldTags;
       const result = await generateStoryCompletion(characterId, contextMessages, {
-        sessionFoldTags: currentSession?.foldTags,
+        sessionFoldTags: foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
         signal: generationRun.controller.signal,
+        streaming: streamingEnabled,
+        onDelta: (delta) => collectStoryStreamDelta(delta, foldTags),
       });
       if (!isCurrentGeneration()) return;
       const assistantMessage = pushStoryMessage({
@@ -850,8 +942,13 @@ export function StoryApp({ onClose }: StoryAppProps) {
       if (activeSessionIdRef.current === sessionId) setMessages(loadStoryMessages(sessionId));
       setStorageVersion(v => v + 1);
     } catch (error) {
-      if (!isCurrentGeneration() || isAbortLikeError(error)) return;
-      const errText = error instanceof Error ? error.message : "重试失败，请稍后再试。";
+      const committedPartial = commitStoryStreamPartial(sessionId, characterId, currentSession?.foldTags);
+      if (isAbortLikeError(error) || committedPartial) return;
+      if (!isCurrentGeneration()) return;
+      const baseMessage = error instanceof Error ? error.message : "重试失败，请稍后再试。";
+      const errText = streamingEnabled
+        ? `${baseMessage}\n（若中转不支持流式，可在剧情侧栏关闭「剧情流式生成」改用整段请求）`
+        : baseMessage;
       const systemMessage = pushStoryMessage({ sessionId, role: "system", rawContent: errText, renderedContent: errText });
       if (activeSessionIdRef.current === sessionId) setMessages(loadStoryMessages(sessionId));
       setStorageVersion(v => v + 1);
@@ -859,6 +956,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
       if (finishStoryGenerationRun(sessionId, generationRunId)) {
         markGenerating(sessionId, false);
       }
+      resetStoryStream();
     }
   }
 
@@ -947,6 +1045,19 @@ export function StoryApp({ onClose }: StoryAppProps) {
 
         <div className="story-drawer-section">
           <div className="story-drawer-eyebrow">显示选项</div>
+          {/* 生成方式：剧情流式接收默认开，关掉回退成原来的整段请求 */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 0", borderBottom: "1px solid var(--c-story-drawer-border, rgba(124, 104, 68, 0.08))" }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-story-text, #4b4335)" }}>剧情流式生成</div>
+              <div style={{ fontSize: "calc(11px*var(--app-text-scale,1))", marginTop: 4, color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))" }}>
+                仅当前会话：正文边生成边显示；关闭则整段返回
+              </div>
+            </div>
+            <Toggle
+              checked={streamingEnabled}
+              onChange={(next) => applySessionUpdates({ streamStory: next })}
+            />
+          </div>
           <div style={{ padding: "10px 0", borderBottom: "1px solid var(--c-story-drawer-border, rgba(124, 104, 68, 0.08))" }}>
             <label style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))", display: "block", marginBottom: 6 }}>
               折叠标签
@@ -1203,6 +1314,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
               <StoryGeneratingIndicator
                 characterName={currentCharacter.name}
                 avatar={currentCharacter.avatar || undefined}
+                previewText={streamPreview}
               />
             ) : null}
           </div>

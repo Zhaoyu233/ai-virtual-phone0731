@@ -16,6 +16,12 @@ export type StorySession = {
   customCSS?: string;
   foldTags?: string;            // Comma-separated tag names to fold for this session.
   contextExcludedTags?: string; // Comma-separated tag names stripped before sending story history to the LLM.
+  /**
+   * 剧情流式接收：边生成边把正文增量喂给界面。
+   * 默认开——整段模式在中转上容易把长正文吞成空串（等半天什么都没有），
+   * 关掉则回退成原来「一次性等整段」的请求。
+   */
+  streamStory?: boolean;
   uiPrefs?: StoryUiPrefs;
   lastMessageId?: string;
   lastMessagePreview?: string;
@@ -184,6 +190,12 @@ export function updateStorySession(sessionId: string, updates: Partial<StorySess
   _sessionsCache[idx] = next;
   storyDb.sessions.put(next).catch(() => undefined);
   return next;
+}
+
+/** 剧情流式接收开关：老会话没有这个字段时按「开」处理（见 StorySession.streamStory 注释），
+ *  只有显式关掉（streamStory === false）才回退成整段请求。 */
+export function isStoryStreamingEnabled(session: Pick<StorySession, "streamStory"> | null | undefined): boolean {
+  return session?.streamStory !== false;
 }
 
 export function pushStoryMessage(

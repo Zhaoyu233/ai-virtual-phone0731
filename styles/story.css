@@ -680,6 +680,35 @@
           }
         }
 
+        /* 流式接收：气泡里实时长出正文（已剥掉思维链/摘要），末尾一个光标 */
+        .story-generating-bubble--stream {
+          display: block;
+          min-height: 40px;
+          /* 打印式正文左对齐：半截行被两端对齐拉开会显得跳 */
+          text-align: left;
+        }
+        .story-generating-stream {
+          white-space: pre-wrap;
+          word-break: break-word;
+          font-size: calc(14px*var(--app-text-scale,1));
+          line-height: 1.78;
+          color: var(--c-story-text, #334155);
+        }
+        .story-generating-caret {
+          display: inline-block;
+          width: 2px;
+          height: 1em;
+          margin-left: 2px;
+          vertical-align: -0.18em;
+          background: currentColor;
+          opacity: 0.45;
+          animation: story-generating-caret 1s ease-in-out infinite;
+        }
+        @keyframes story-generating-caret {
+          0%, 100% { opacity: 0.12; }
+          50% { opacity: 0.55; }
+        }
+
         /* === 富文本排版 (Typography Aesthetic) === */
         .story-richtext {
           font-size: calc(14px*var(--app-text-scale,1));
